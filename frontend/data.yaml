@@ -1,0 +1,20 @@
+path: /content/drive/MyDrive/PCB_mobile
+
+train: train/images
+val: valid/images
+
+nc: 13
+names:
+  0: missing_solder
+  1: dry
+  2: missalingn_cap
+  3: MOV cap
+  4: capacitor
+  5: push button
+  6: damage_component
+  7: screw
+  8: bridge
+  9: cover open switch
+  10: without MOV cap
+  11: missing screw
+  12: 35 KV spring
