@@ -8,6 +8,8 @@ env/
 
 .streamlit/
 .pytest_cache/
+.vscode/
+*.pt
 
 frontend/frontend.out.log
 frontend/frontend.err.log

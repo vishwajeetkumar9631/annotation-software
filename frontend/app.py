@@ -9,10 +9,8 @@ from typing import Any
 
 import requests
 import streamlit as st
-from streamlit.elements.lib.image_utils import image_to_url
 import streamlit.elements.image as st_image
 from PIL import Image
-from streamlit_drawable_canvas import st_canvas
 
 
 API_URL = os.environ.get("ANNOTATION_API_URL", "http://127.0.0.1:8000")
@@ -45,10 +43,14 @@ def install_canvas_image_compat() -> None:
     if hasattr(st_image, "image_to_url"):
         return
 
+    from streamlit.elements.lib.image_utils import image_to_url
+
     st_image.image_to_url = image_to_url
 
 
 install_canvas_image_compat()
+
+from streamlit_drawable_canvas import st_canvas
 
 
 def api(method: str, path: str, **kwargs: Any) -> requests.Response:
@@ -382,6 +384,55 @@ def save_yolo_seg_source_folder() -> dict[str, Any]:
     return api("POST", "/api/export/yolo-seg/source-folder").json()
 
 
+def train_yolo_model(
+    base_model: str,
+    epochs: int,
+    image_size: int,
+    batch_size: int,
+    device: str,
+    workers: int,
+) -> dict[str, Any]:
+    return api(
+        "POST",
+        "/api/ml/yolo/train",
+        json={
+            "base_model": base_model,
+            "epochs": epochs,
+            "image_size": image_size,
+            "batch_size": batch_size,
+            "device": device,
+            "workers": workers,
+        },
+    ).json()
+
+
+def yolo_training_status() -> dict[str, Any]:
+    return api("GET", "/api/ml/yolo/status").json()
+
+
+def yolo_environment() -> dict[str, Any]:
+    return api("GET", "/api/ml/yolo/environment").json()
+
+
+def auto_annotate_yolo(
+    file_ids: list[str],
+    confidence: float,
+    replace_existing: bool,
+    device: str,
+) -> dict[str, Any]:
+    return api(
+        "POST",
+        "/api/ml/yolo/auto-annotate",
+        request_timeout=600,
+        json={
+            "file_ids": file_ids,
+            "confidence": confidence,
+            "replace_existing": replace_existing,
+            "device": device,
+        },
+    ).json()
+
+
 st.title("Annotation MVP")
 st.caption("Python UI for image upload, class labels, bounding boxes, save, and export.")
 
@@ -534,6 +585,78 @@ with st.sidebar:
             f"Saved {result['images_written']} image(s) to {result['image_folder']} and "
             f"{result['labels_written']} label file(s) to {result['label_folder']}."
         )
+
+    st.divider()
+    st.header("Auto Annotation")
+    yolo_status = yolo_training_status()
+    yolo_environment_info = yolo_environment()
+    if yolo_environment_info.get("cuda_available"):
+        device_names = ", ".join(yolo_environment_info.get("devices", []))
+        st.success(f"CUDA ready: {device_names}")
+    else:
+        st.warning(
+            f"CUDA unavailable in backend environment. Installed torch: "
+            f"{yolo_environment_info.get('torch_version') or 'not installed'}"
+        )
+    if yolo_status.get("running"):
+        st.info(yolo_status.get("message", "Training YOLO model."))
+    elif yolo_status.get("error"):
+        st.error(yolo_status["error"])
+    elif yolo_status.get("model_exists"):
+        st.success("YOLO model is ready.")
+    else:
+        st.caption("Train a YOLO model from saved boxes, then use it to pre-label images.")
+
+    with st.expander("Train YOLO", expanded=False):
+        yolo_base_model = st.selectbox(
+            "Base model",
+            ["yolov8n.pt", "yolov8s.pt", "yolov8m.pt"],
+            help="Smaller models train faster. Larger models may be more accurate.",
+        )
+        yolo_epochs = st.number_input("Epochs", min_value=1, max_value=1000, value=50, step=1)
+        yolo_image_size = st.number_input("Image size", min_value=128, max_value=2048, value=640, step=32)
+        yolo_batch_size = st.number_input("Batch size", min_value=1, max_value=128, value=4, step=1)
+        yolo_device_label = st.selectbox("Training device", ["GPU", "Auto", "CPU"])
+        yolo_device = yolo_device_label.lower()
+        yolo_workers = st.number_input("Data loader workers", min_value=0, max_value=32, value=0, step=1)
+        gpu_requested_without_cuda = yolo_device == "gpu" and not yolo_environment_info.get("cuda_available")
+        train_disabled = yolo_status.get("running") or not labels or not annotations or gpu_requested_without_cuda
+        if st.button("Start training", disabled=train_disabled, use_container_width=True):
+            train_yolo_model(
+                yolo_base_model,
+                int(yolo_epochs),
+                int(yolo_image_size),
+                int(yolo_batch_size),
+                yolo_device,
+                int(yolo_workers),
+            )
+            st.success("YOLO training started.")
+            st.rerun()
+        if not labels or not annotations:
+            st.caption("Add labels and save annotations before training.")
+        elif gpu_requested_without_cuda:
+            st.caption("Install CUDA-enabled PyTorch in the backend environment to enable GPU training.")
+
+    with st.expander("Run auto annotation", expanded=False):
+        auto_confidence = st.slider("Confidence", min_value=0.05, max_value=0.95, value=0.35, step=0.05)
+        auto_replace = st.checkbox("Replace existing boxes")
+        auto_scope = st.radio("Images", ["Selected image", "All images"], horizontal=True)
+        auto_device = st.selectbox("Prediction device", ["Auto", "GPU", "CPU"]).lower()
+        auto_gpu_unavailable = auto_device == "gpu" and not yolo_environment_info.get("cuda_available")
+        auto_disabled = yolo_status.get("running") or not yolo_status.get("model_exists") or not files
+        auto_disabled = auto_disabled or auto_gpu_unavailable
+        if st.button("Auto annotate", disabled=auto_disabled, use_container_width=True):
+            selected_auto_ids = (
+                [st.session_state.get("selected_file_id") or files[0]["id"]]
+                if auto_scope == "Selected image"
+                else [file["id"] for file in files]
+            )
+            result = auto_annotate_yolo(selected_auto_ids, float(auto_confidence), auto_replace, auto_device)
+            st.success(
+                f"Auto annotated {result['files_processed']} image(s), "
+                f"added {result['annotations_added']} box(es)."
+            )
+            st.rerun()
 
 if not files:
     st.info("Upload an image from the sidebar to begin.")

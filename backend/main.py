@@ -7,6 +7,7 @@ import os
 import shutil
 import stat
 import threading
+import time
 import uuid
 import zipfile
 from pathlib import Path
@@ -25,8 +26,23 @@ UPLOAD_DIR = DATA_DIR / "uploads"
 SOURCE_DIR = DATA_DIR / "source"
 SOURCE_IMAGE_DIR = SOURCE_DIR / "images"
 SOURCE_LABEL_DIR = SOURCE_DIR / "labels"
+SOURCE_DATA_YAML = SOURCE_DIR / "data.yaml"
+FRONTEND_DATA_YAML = ROOT.parent / "frontend" / "data.yaml"
 DB_PATH = DATA_DIR / "db.json"
+MODEL_DIR = DATA_DIR / "models"
+RUNS_DIR = DATA_DIR / "runs"
+TRAINING_DATASET_DIR = DATA_DIR / "training"
+BEST_MODEL_PATH = MODEL_DIR / "best.pt"
 STORE_LOCK = threading.Lock()
+TRAINING_LOCK = threading.Lock()
+TRAINING_STATUS: dict[str, Any] = {
+    "running": False,
+    "started_at": None,
+    "finished_at": None,
+    "message": "No training has started.",
+    "model_path": None,
+    "error": None,
+}
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
 LABEL_COLORS = [
@@ -105,6 +121,22 @@ class RotationAugmentPayload(BaseModel):
     height: int | None = Field(default=None, gt=0)
 
 
+class YoloTrainPayload(BaseModel):
+    base_model: str = "yolov8n.pt"
+    epochs: int = Field(default=50, ge=1, le=1000)
+    image_size: int = Field(default=640, ge=128, le=2048)
+    batch_size: int = Field(default=4, ge=1, le=128)
+    device: Literal["auto", "gpu", "cpu"] = "gpu"
+    workers: int = Field(default=0, ge=0, le=32)
+
+
+class AutoAnnotatePayload(BaseModel):
+    file_ids: list[str] | None = None
+    confidence: float = Field(default=0.35, ge=0.01, le=1.0)
+    replace_existing: bool = False
+    device: Literal["auto", "gpu", "cpu"] = "auto"
+
+
 class Store(BaseModel):
     labels: list[Label] = Field(default_factory=list)
     files: list[FileRecord] = Field(default_factory=list)
@@ -117,6 +149,9 @@ def ensure_store() -> None:
     SOURCE_DIR.mkdir(exist_ok=True)
     SOURCE_IMAGE_DIR.mkdir(exist_ok=True)
     SOURCE_LABEL_DIR.mkdir(exist_ok=True)
+    MODEL_DIR.mkdir(exist_ok=True)
+    RUNS_DIR.mkdir(exist_ok=True)
+    TRAINING_DATASET_DIR.mkdir(exist_ok=True)
     if not DB_PATH.exists():
         DB_PATH.write_text(Store().model_dump_json(indent=2), encoding="utf-8")
 
@@ -204,6 +239,21 @@ def remove_missing_file_records(store: Store) -> bool:
     store.files = [file for file in store.files if file.id in existing_file_ids]
     store.annotations = [annotation for annotation in store.annotations if annotation.file_id in existing_file_ids]
     return True
+
+
+def write_current_data_yaml(store: Store) -> None:
+    ensure_store()
+    (SOURCE_DIR / "classes.txt").write_text("\n".join(label.name for label in store.labels), encoding="utf-8")
+    yaml_content = (
+        f"path: {json.dumps(SOURCE_DIR.resolve().as_posix())}\n"
+        "train: images\n"
+        "val: images\n"
+        f"nc: {len(store.labels)}\n"
+        f"names: {json.dumps([label.name for label in store.labels])}\n"
+    )
+    SOURCE_DATA_YAML.write_text(yaml_content, encoding="utf-8")
+    if FRONTEND_DATA_YAML.parent.exists():
+        FRONTEND_DATA_YAML.write_text(yaml_content, encoding="utf-8")
 
 
 def yolo_rows(file: FileRecord, annotations: list[BoundingBox], label_index: dict[str, int]) -> list[str]:
@@ -392,14 +442,7 @@ def write_yolo_source_folder(store: Store) -> dict[str, int | str]:
         label_count += 1
 
     (SOURCE_DIR / "classes.txt").write_text("\n".join(label.name for label in store.labels), encoding="utf-8")
-    (SOURCE_DIR / "data.yaml").write_text(
-        "path: .\n"
-        "train: images\n"
-        "val: images\n"
-        f"nc: {len(store.labels)}\n"
-        f"names: {[label.name for label in store.labels]!r}\n",
-        encoding="utf-8",
-    )
+    write_current_data_yaml(store)
 
     return {
         "folder": str(SOURCE_DIR),
@@ -440,14 +483,7 @@ def write_yolo_seg_source_folder(store: Store) -> dict[str, int | str]:
         label_count += 1
 
     (SOURCE_DIR / "classes.txt").write_text("\n".join(label.name for label in store.labels), encoding="utf-8")
-    (SOURCE_DIR / "data.yaml").write_text(
-        "path: .\n"
-        "train: images\n"
-        "val: images\n"
-        f"nc: {len(store.labels)}\n"
-        f"names: {[label.name for label in store.labels]!r}\n",
-        encoding="utf-8",
-    )
+    write_current_data_yaml(store)
 
     return {
         "folder": str(SOURCE_DIR),
@@ -456,6 +492,245 @@ def write_yolo_seg_source_folder(store: Store) -> dict[str, int | str]:
         "images_written": image_count,
         "labels_written": label_count,
     }
+
+
+def load_yolo_class() -> Any:
+    try:
+        from ultralytics import YOLO
+    except ImportError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="Ultralytics is not installed. Run `pip install -r backend/requirements.txt` in the backend environment.",
+        ) from exc
+    return YOLO
+
+
+def gpu_environment() -> dict[str, Any]:
+    try:
+        import torch
+    except ImportError:
+        return {
+            "torch_installed": False,
+            "torch_version": None,
+            "cuda_available": False,
+            "cuda_version": None,
+            "device_count": 0,
+            "devices": [],
+        }
+
+    cuda_available = torch.cuda.is_available()
+    device_count = torch.cuda.device_count() if cuda_available else 0
+    return {
+        "torch_installed": True,
+        "torch_version": torch.__version__,
+        "cuda_available": cuda_available,
+        "cuda_version": torch.version.cuda,
+        "device_count": device_count,
+        "devices": [torch.cuda.get_device_name(index) for index in range(device_count)],
+    }
+
+
+def resolve_yolo_device(requested_device: str) -> str | int:
+    environment = gpu_environment()
+    if requested_device == "cpu":
+        return "cpu"
+    if environment["cuda_available"]:
+        return 0
+    if requested_device == "gpu":
+        raise RuntimeError(
+            "GPU training was requested, but CUDA-enabled PyTorch is not available. "
+            f"Installed torch: {environment['torch_version']}. Install the CUDA PyTorch build in backend/.venv."
+        )
+    return "cpu"
+
+
+def update_training_status(**values: Any) -> None:
+    with TRAINING_LOCK:
+        TRAINING_STATUS.update(values)
+
+
+def training_dataset_summary(store: Store) -> dict[str, int]:
+    annotated_file_ids = {annotation.file_id for annotation in store.annotations}
+    return {
+        "labels": len(store.labels),
+        "files": len(store.files),
+        "annotations": len(store.annotations),
+        "annotated_files": len(annotated_file_ids),
+    }
+
+
+def write_yolo_training_dataset(store: Store) -> Path:
+    annotated_file_ids = {annotation.file_id for annotation in store.annotations}
+    annotated_files = sorted(
+        [file for file in store.files if file.id in annotated_file_ids],
+        key=lambda file: (file.filename.lower(), file.id),
+    )
+    if not annotated_files:
+        raise RuntimeError("Save annotations before training.")
+
+    clear_directory(TRAINING_DATASET_DIR)
+    for split in ("train", "val"):
+        (TRAINING_DATASET_DIR / "images" / split).mkdir(parents=True, exist_ok=True)
+        (TRAINING_DATASET_DIR / "labels" / split).mkdir(parents=True, exist_ok=True)
+
+    if len(annotated_files) == 1:
+        split_files = {"train": annotated_files, "val": annotated_files}
+    else:
+        train_count = max(1, min(len(annotated_files) - 1, round(len(annotated_files) * 0.8)))
+        split_files = {
+            "train": annotated_files[:train_count],
+            "val": annotated_files[train_count:],
+        }
+
+    label_index = {label.id: index for index, label in enumerate(store.labels)}
+    annotations_by_file = {
+        file.id: [annotation for annotation in store.annotations if annotation.file_id == file.id]
+        for file in annotated_files
+    }
+    used_names: set[str] = set()
+    for split, files in split_files.items():
+        for file in files:
+            source = uploaded_path(file.id)
+            if source is None:
+                continue
+            image_name = unique_dataset_filename(file.filename, used_names)
+            shutil.copy2(source, TRAINING_DATASET_DIR / "images" / split / image_name)
+            rows = yolo_rows(file, annotations_by_file[file.id], label_index)
+            (TRAINING_DATASET_DIR / "labels" / split / f"{Path(image_name).stem}.txt").write_text(
+                "\n".join(rows),
+                encoding="utf-8",
+            )
+
+    data_yaml = TRAINING_DATASET_DIR / "data.yaml"
+    data_yaml.write_text(
+        f"path: {json.dumps(TRAINING_DATASET_DIR.resolve().as_posix())}\n"
+        "train: images/train\n"
+        "val: images/val\n"
+        f"nc: {len(store.labels)}\n"
+        f"names: {json.dumps([label.name for label in store.labels])}\n",
+        encoding="utf-8",
+    )
+    return data_yaml
+
+
+def run_yolo_training(payload: YoloTrainPayload) -> None:
+    try:
+        update_training_status(
+            running=True,
+            started_at=time.strftime("%Y-%m-%d %H:%M:%S"),
+            finished_at=None,
+            message="Preparing YOLO dataset.",
+            error=None,
+        )
+        with STORE_LOCK:
+            store = read_store()
+            summary = training_dataset_summary(store)
+            if summary["labels"] == 0:
+                raise RuntimeError("Create at least one label before training.")
+            if summary["annotations"] == 0:
+                raise RuntimeError("Save annotations before training.")
+            training_data_yaml = write_yolo_training_dataset(store)
+
+        update_training_status(message="Training YOLO model.")
+        YOLO = load_yolo_class()
+        device = resolve_yolo_device(payload.device)
+        update_training_status(
+            message=f"Training YOLO model on {'GPU 0' if device == 0 else 'CPU'}.",
+            device=device,
+            gpu_environment=gpu_environment(),
+        )
+        model = YOLO(payload.base_model)
+        results = model.train(
+            data=str(training_data_yaml),
+            epochs=payload.epochs,
+            imgsz=payload.image_size,
+            batch=payload.batch_size,
+            device=device,
+            workers=payload.workers,
+            amp=device != "cpu",
+            cache=False,
+            project=str(RUNS_DIR),
+            name="detect",
+            exist_ok=True,
+        )
+
+        save_dir = Path(str(getattr(results, "save_dir", RUNS_DIR / "detect")))
+        best_model = save_dir / "weights" / "best.pt"
+        if not best_model.exists():
+            best_model = RUNS_DIR / "detect" / "weights" / "best.pt"
+        if not best_model.exists():
+            raise RuntimeError("Training finished, but best.pt was not found.")
+
+        ensure_store()
+        shutil.copy2(best_model, BEST_MODEL_PATH)
+        update_training_status(
+            running=False,
+            finished_at=time.strftime("%Y-%m-%d %H:%M:%S"),
+            message="Training complete.",
+            model_path=str(BEST_MODEL_PATH),
+            error=None,
+        )
+    except Exception as exc:
+        update_training_status(
+            running=False,
+            finished_at=time.strftime("%Y-%m-%d %H:%M:%S"),
+            message="Training failed.",
+            error=str(exc),
+        )
+
+
+def predicted_boxes_for_file(
+    model: Any,
+    file: FileRecord,
+    source: Path,
+    labels: list[Label],
+    confidence: float,
+    device: str | int,
+) -> list[BoundingBox]:
+    results = model.predict(str(source), conf=confidence, device=device, verbose=False)
+    if not results:
+        return []
+
+    boxes = getattr(results[0], "boxes", None)
+    if boxes is None:
+        return []
+
+    annotations: list[BoundingBox] = []
+    xyxy_values = boxes.xyxy.cpu().tolist()
+    class_values = boxes.cls.cpu().tolist()
+    confidence_values = boxes.conf.cpu().tolist()
+    image_width = float(file.width or 0)
+    image_height = float(file.height or 0)
+
+    for xyxy, class_index, detected_confidence in zip(xyxy_values, class_values, confidence_values):
+        if detected_confidence < confidence:
+            continue
+        label_index = int(class_index)
+        if label_index < 0 or label_index >= len(labels):
+            continue
+
+        x1, y1, x2, y2 = [float(value) for value in xyxy]
+        left = max(0.0, x1)
+        top = max(0.0, y1)
+        right = min(image_width, x2) if image_width > 0 else x2
+        bottom = min(image_height, y2) if image_height > 0 else y2
+        width = round(right - left, 2)
+        height = round(bottom - top, 2)
+        if width <= 0 or height <= 0:
+            continue
+
+        annotations.append(
+            BoundingBox(
+                file_id=file.id,
+                label_id=labels[label_index].id,
+                type="bbox",
+                x=round(left, 2),
+                y=round(top, 2),
+                width=width,
+                height=height,
+            )
+        )
+    return annotations
 
 
 def rotated_bbox(
@@ -533,6 +808,7 @@ def create_label(label: Label) -> Label:
         raise HTTPException(status_code=409, detail="Label already exists")
     store.labels.append(label)
     write_store(store)
+    write_current_data_yaml(store)
     return label
 
 
@@ -552,6 +828,7 @@ def update_label(label_id: str, payload: LabelUpdate) -> Label:
     label.name = cleaned_name
     label.color = payload.color
     write_store(store)
+    write_current_data_yaml(store)
     return label
 
 
@@ -565,6 +842,7 @@ def delete_label(label_id: str) -> dict[str, int | str]:
     store.labels = [item for item in store.labels if item.id != label_id]
     store.annotations = [item for item in store.annotations if item.label_id != label_id]
     write_store(store)
+    write_current_data_yaml(store)
     return {"status": "deleted", "annotations_removed": annotation_count}
 
 
@@ -815,6 +1093,96 @@ def augment_rotate_file(file_id: str, payload: RotationAugmentPayload) -> list[F
     write_store(store)
     write_yolo_source_folder(store)
     return created_records
+
+
+@app.post("/api/ml/yolo/train")
+def start_yolo_training(payload: YoloTrainPayload) -> dict[str, Any]:
+    with TRAINING_LOCK:
+        if TRAINING_STATUS["running"]:
+            raise HTTPException(status_code=409, detail="YOLO training is already running")
+        TRAINING_STATUS.update(
+            {
+                "running": True,
+                "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "finished_at": None,
+                "message": "Training queued.",
+                "error": None,
+            }
+        )
+
+    thread = threading.Thread(target=run_yolo_training, args=(payload,), daemon=True)
+    thread.start()
+    return {"status": "started", **TRAINING_STATUS}
+
+
+@app.get("/api/ml/yolo/status")
+def yolo_training_status() -> dict[str, Any]:
+    with TRAINING_LOCK:
+        status = dict(TRAINING_STATUS)
+    status["model_exists"] = BEST_MODEL_PATH.exists()
+    if status.get("model_path") is None and BEST_MODEL_PATH.exists():
+        status["model_path"] = str(BEST_MODEL_PATH)
+    return status
+
+
+@app.get("/api/ml/yolo/environment")
+def yolo_environment() -> dict[str, Any]:
+    return gpu_environment()
+
+
+@app.post("/api/ml/yolo/auto-annotate")
+def auto_annotate_with_yolo(payload: AutoAnnotatePayload) -> dict[str, Any]:
+    if not BEST_MODEL_PATH.exists():
+        raise HTTPException(status_code=404, detail="Train a YOLO model before auto annotation")
+
+    YOLO = load_yolo_class()
+    model = YOLO(str(BEST_MODEL_PATH))
+    try:
+        device = resolve_yolo_device(payload.device)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    with STORE_LOCK:
+        store = read_store()
+        if not store.labels:
+            raise HTTPException(status_code=400, detail="No labels are available")
+
+        selected_ids = set(payload.file_ids or [file.id for file in store.files])
+        files_by_id = {file.id: file for file in store.files}
+        unknown_ids = selected_ids - set(files_by_id)
+        if unknown_ids:
+            raise HTTPException(status_code=404, detail=f"Unknown file id: {sorted(unknown_ids)[0]}")
+
+        new_annotations: list[BoundingBox] = []
+        files_processed = 0
+        for file_id in selected_ids:
+            file = files_by_id[file_id]
+            source = uploaded_path(file.id)
+            if source is None:
+                continue
+            predicted_annotations = predicted_boxes_for_file(
+                model,
+                file,
+                source,
+                store.labels,
+                payload.confidence,
+                device,
+            )
+            if payload.replace_existing:
+                store.annotations = [annotation for annotation in store.annotations if annotation.file_id != file.id]
+            store.annotations.extend(predicted_annotations)
+            new_annotations.extend(predicted_annotations)
+            files_processed += 1
+
+        write_store(store)
+
+    return {
+        "files_processed": files_processed,
+        "annotations_added": len(new_annotations),
+        "replace_existing": payload.replace_existing,
+        "confidence": payload.confidence,
+        "device": device,
+    }
 
 
 @app.put("/api/files/{file_id}/annotations")
